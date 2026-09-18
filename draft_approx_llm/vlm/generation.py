@@ -14,6 +14,7 @@ class PreparedTargetInput:
     position_ids: torch.Tensor
     input_ids: torch.Tensor
     vision_encoder_ms: float
+    position_strategy: str = "mrope"
 
 
 @torch.inference_mode()
@@ -66,17 +67,44 @@ def prepare_target_input(
         position_ids=position_ids,
         input_ids=input_ids,
         vision_encoder_ms=vision_encoder_ms,
+        position_strategy="mrope",
     )
 
 
-def select_target_input(prepared: PreparedTargetInput, keep_indices: torch.Tensor) -> PreparedTargetInput:
+def select_target_input(
+    prepared: PreparedTargetInput,
+    keep_indices: torch.Tensor,
+    position_strategy: str = "mrope",
+) -> PreparedTargetInput:
+    """Select compressed embeddings and assign their Qwen2.5-VL positions.
+
+    ``mrope`` preserves the original three-axis visual positions, retaining the
+    image grid geometry after sparse token selection. ``contiguous`` implements
+    the paper's text-model policy by reassigning 0..N-1 on all three axes.  The
+    latter is exposed as an explicit ablation because it discards 2D visual
+    coordinates.
+    """
     keep = keep_indices.to(prepared.inputs_embeds.device)
+    if position_strategy == "mrope":
+        position_ids = prepared.position_ids.index_select(2, keep)
+    elif position_strategy == "contiguous":
+        length = int(keep.numel())
+        position_ids = torch.arange(
+            length,
+            dtype=prepared.position_ids.dtype,
+            device=prepared.position_ids.device,
+        ).view(1, 1, length).expand(3, prepared.position_ids.shape[1], length)
+    else:
+        raise ValueError(
+            f"Unknown position_strategy={position_strategy!r}; expected 'mrope' or 'contiguous'"
+        )
     return PreparedTargetInput(
         inputs_embeds=prepared.inputs_embeds.index_select(1, keep),
         attention_mask=prepared.attention_mask.index_select(1, keep),
-        position_ids=prepared.position_ids.index_select(2, keep),
+        position_ids=position_ids,
         input_ids=prepared.input_ids.index_select(1, keep),
         vision_encoder_ms=prepared.vision_encoder_ms,
+        position_strategy=position_strategy,
     )
 
 

@@ -5,6 +5,34 @@ import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
+
+
+def _centered_pool1d(values: torch.Tensor, kernel_size: int, mode: str) -> torch.Tensor:
+    """Length-preserving centered pooling with the paper/repository padding rule."""
+    if values.ndim != 1:
+        raise ValueError(f"Expected a 1D tensor, got {tuple(values.shape)}")
+    if kernel_size < 1:
+        raise ValueError("kernel_size must be positive")
+    if kernel_size == 1:
+        return values.clone()
+    left = (kernel_size - 1) // 2
+    right = kernel_size - 1 - left
+    batched = values.float().view(1, 1, -1)
+    if mode == "avg":
+        padded = F.pad(batched, (left, right), mode="constant", value=0.0)
+        pooled = F.avg_pool1d(padded, kernel_size=kernel_size, stride=1)
+    elif mode == "max":
+        padded = F.pad(
+            batched,
+            (left, right),
+            mode="constant",
+            value=torch.finfo(batched.dtype).min,
+        )
+        pooled = F.max_pool1d(padded, kernel_size=kernel_size, stride=1)
+    else:
+        raise ValueError(f"Unsupported pool mode: {mode}")
+    return pooled.view(-1).to(values.dtype)
 
 
 @dataclass
@@ -88,7 +116,12 @@ class MultimodalTokenLayout:
         )
         return self.select_visual_tokens_by_count(scores, keep_count)
 
-    def select_visual_tokens_by_count(self, scores: torch.Tensor, keep_count: int) -> torch.Tensor:
+    def select_visual_tokens_by_count(
+        self,
+        scores: torch.Tensor,
+        keep_count: int,
+        always_keep_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Keep an exact number of visual tokens while preserving every text/control token."""
         if scores.ndim != 1 or scores.numel() != self.sequence_length:
             raise ValueError(
@@ -99,10 +132,60 @@ class MultimodalTokenLayout:
                 f"keep_count must be in [1, {self.visual_token_count}], got {keep_count}"
             )
         visual_indices = self.visual_indices.to(scores.device)
-        selected_offsets = torch.topk(scores[visual_indices], keep_count, sorted=False).indices
-        selected_visual = visual_indices[selected_offsets].to(self.non_visual_indices.device)
+        mandatory_visual = torch.empty(0, dtype=torch.long, device=scores.device)
+        if always_keep_indices is not None:
+            mandatory = always_keep_indices.to(scores.device)
+            mandatory_visual = mandatory[
+                torch.isin(mandatory, visual_indices)
+            ].unique(sorted=True)
+        if mandatory_visual.numel() > keep_count:
+            raise ValueError(
+                f"keep_count={keep_count} is smaller than the number of mandatory "
+                f"visual window tokens={mandatory_visual.numel()}"
+            )
+        candidates = visual_indices[~torch.isin(visual_indices, mandatory_visual)]
+        remaining = keep_count - int(mandatory_visual.numel())
+        if remaining:
+            selected_offsets = torch.topk(
+                scores[candidates], remaining, sorted=False
+            ).indices
+            selected_visual = torch.cat([mandatory_visual, candidates[selected_offsets]])
+        else:
+            selected_visual = mandatory_visual
+        selected_visual = selected_visual.to(self.non_visual_indices.device)
         keep_indices = torch.cat([self.non_visual_indices, selected_visual]).sort().values
         return keep_indices
+
+    def pool_visual_scores(
+        self,
+        scores: torch.Tensor,
+        average_kernel: int,
+        neighbor_kernel: int,
+    ) -> torch.Tensor:
+        """Apply Algorithm 2 AvgPool then neighborhood MaxPool per image.
+
+        Pooling is reset at every image boundary so evidence cannot leak from one
+        image into another through adjacent flattened token positions.
+        """
+        if scores.ndim != 1 or scores.numel() != self.sequence_length:
+            raise ValueError(
+                f"Expected one score per input token ({self.sequence_length}), "
+                f"got {tuple(scores.shape)}"
+            )
+        pooled = scores.clone()
+        for indices in self.image_visual_indices:
+            device_indices = indices.to(scores.device)
+            image_scores = scores[device_indices]
+            image_scores = _centered_pool1d(image_scores, average_kernel, "avg")
+            image_scores = _centered_pool1d(image_scores, neighbor_kernel, "max")
+            pooled[device_indices] = image_scores
+        return pooled
+
+    def final_window_indices(self, window_size: int) -> torch.Tensor:
+        if window_size < 1:
+            raise ValueError("window_size must be positive")
+        start = max(0, self.sequence_length - window_size)
+        return torch.arange(start, self.sequence_length, dtype=torch.long)
 
     def per_image_selected_counts(self, keep_indices: torch.Tensor) -> list[int]:
         keep = set(int(index) for index in keep_indices.cpu().tolist())
